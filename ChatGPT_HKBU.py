@@ -1,71 +1,85 @@
 import requests
-import configparser
+import logging
+from config import LLMConfig, load_secrets
+
+logger = logging.getLogger(__name__)
 
 
-# A simple client for the ChatGPT REST API
 class ChatGPT:
-    def __init__(self, config):
-        # Read API configuration values from the ini file
-        api_key = config['CHATGPT']['API_KEY']
-        base_url = config['CHATGPT']['BASE_URL']
-        model = config['CHATGPT']['MODEL']
-        api_ver = config['CHATGPT']['API_VER']
+    def __init__(self, config_ini_data=None):
+        # If no config object is passed in, load directly from secrets
+        if config_ini_data is None:
+            secrets = load_secrets()
+            api_key = secrets['CHATGPT_API_KEY']
+            base_url = secrets['CHATGPT_BASE_URL']
+            model = secrets['CHATGPT_MODEL']
+            api_ver = secrets['CHATGPT_API_VER']
+        else:
+            api_key = config_ini_data['CHATGPT']['API_KEY']
+            base_url = config_ini_data['CHATGPT']['BASE_URL']
+            model = config_ini_data['CHATGPT']['MODEL']
+            api_ver = config_ini_data['CHATGPT']['API_VER']
 
-        # Construct the full REST endpoint URL for chat completions
         self.url = f'{base_url}/deployments/{model}/chat/completions?api-version={api_ver}'
-
-        # Set HTTP headers required for authentication and JSON payload
         self.headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
             "api-key": api_key,
         }
 
-        # Define the system prompt to guide the assistant’s behavior
-        self.system_message = (
-            'You are a helper! Your users are university students. '
-            'Your replies should be conversational, informative, use simple words, and be straightforward.'
-        )
+        self.base_system_template = LLMConfig.SYSTEM_PROMPT_TEMPLATE
+        self.job_context = ""
+
+    def set_job_context(self, context_text: str):
+        self.job_context = context_text if context_text else "No relevant job data retrieved."
 
     def submit(self, user_message: str):
+        # Prompt Template
+        system_content = self.base_system_template.format(context=self.job_context)
 
-        # Build the conversation history: system + user message
         messages = [
-            {"role": "system", "content": self.system_message},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_message},
         ]
 
-        # Prepare the request payload with generation parameters
         payload = {
             "messages": messages,
-            "temperature": 1,  # randomness of output (higher = more creative)
-            "max_tokens": 150,  # maximum length of the reply
-            "top_p": 1,  # nucleus sampling parameter
-            "stream": False  # disable streaming, wait for full reply
+            "temperature": LLMConfig.TEMPERATURE,
+            "max_tokens": LLMConfig.MAX_TOKENS,
+            "top_p": LLMConfig.TOP_P,
+            "stream": False
         }
 
-        # Send the request to the ChatGPT REST API
-        response = requests.post(self.url, json=payload, headers=self.headers)
-
-        # If successful, return the assistant’s reply text
-        if response.status_code == 200:
+        try:
+            response = requests.post(
+                self.url,
+                json=payload,
+                headers=self.headers,
+                timeout=LLMConfig.TIMEOUT
+            )
+            response.raise_for_status()
             return response.json()['choices'][0]['message']['content']
-        else:
-            # Otherwise return error details
-            return "Error: " + response.text
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API Request failed: {e}")
 
 
-if __name__ == '__main__':
-    # Load configuration from ini file
-    config = configparser.ConfigParser()
-    config.read('config.ini')
+            error_detail = "Unknown error"
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    resp_json = e.response.json()
 
-    # Initialize ChatGPT client
-    chatGPT = ChatGPT(config)
+                    if 'error' in resp_json:
+                        error_detail = resp_json['error'].get('message', str(resp_json['error']))
+                        logger.error(f"API detailed error information：{error_detail}")
+                    else:
+                        error_detail = str(resp_json)
+                except Exception:
+                    error_detail = e.response.text
 
-    # Simple REPL loop: read user input, send to ChatGPT, print reply
-    while True:
-        print('Input your query: ', end='')
-        response = chatGPT.submit(input())
+            # Message returned to the user
+            return f"System error：{error_detail}"
 
-        print(response)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return "An unexpected error occurred."

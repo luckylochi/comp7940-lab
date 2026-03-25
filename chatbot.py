@@ -1,53 +1,274 @@
-'''
-This program requires the following modules:
-- python-telegram-bot==22.5
-- urllib3==2.6.2
-'''
-from ChatGPT_HKBU import ChatGPT
-gpt = None
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
-import configparser
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import logging
+from config import load_secrets, BotConfig, SKILLS_SYSTEM_PROMPT
+from ChatGPT_HKBU import ChatGPT
+from rag_engine import SimpleJobRAG
+from pdf_processor import extract_text_from_pdf
+import os
+import tempfile
+import asyncio
+import httpx
+# ──────────────────────────────────────────────
+# Mode Constants
+# ──────────────────────────────────────────────
+MODE_JOB = 'job'
+MODE_SKILL = 'skill'
+
+# ──────────────────────────────────────────────
+# System Prompt for Skill Inquiry mode
+# (used to override the second ChatGPT instance)
+# ──────────────────────────────────────────────
+
+#SKILLS_SYSTEM_PROMPT = """
+#You are a Senior HR Director and Technical Expert with over 10 years of experience recruiting for top-tier foreign enterprises and multinational corporations.
+#When a user asks about a specific job position, directly provide the required skills for that role.
+
+#Please strictly format your output as follows:
+#**[Must-Have Skills]**
+#- (List the core hard skills and technical proficiencies)
+#"""
+
+gpt = None
+gpt_skill = None
+rag_engine = None
+
 
 
 def main():
+    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-
-    # Configure logging so you can see initialization and error messages
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                        level=logging.INFO)
-
-    # Load the configuration data from file
     logging.info('INIT: Loading configuration...')
-    config = configparser.ConfigParser()
-    config.read('config.ini')
-    global gpt
-    gpt = ChatGPT(config)
-    # Create an Application for your bot
+    try:
+        secrets = load_secrets()
+    except FileNotFoundError as e:
+        logging.error(e)
+        return
+
+    global gpt, gpt_skill, rag_engine
+
+    # 1. Initialize LLM – Job mode (uses default system prompt from config)
+    gpt = ChatGPT()
+
+    # 1b. Initialize LLM – Skill mode (override system prompt, same API credentials)
+    gpt_skill = ChatGPT()
+    gpt_skill.base_system_template = SKILLS_SYSTEM_PROMPT
+
+    # 2. Initialize RAG engine
+    try:
+        rag_engine = SimpleJobRAG()
+        logging.info("RAG Engine initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize RAG Engine: {e}")
+        rag_engine = None
+
     logging.info('INIT: Connecting the Telegram bot...')
-    app = ApplicationBuilder().token(config['TELEGRAM']['ACCESS_TOKEN']).build()
+    app = ApplicationBuilder().token(secrets['TELEGRAM_TOKEN']).build()
 
-    # Register a message handler
-    logging.info('INIT: Registering the message handler...')
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, callback))
+    logging.info('INIT: Registering handlers...')
 
-    # Start the bot
-    logging.info('INIT: Initialization done!')
+    # Command handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("job", job_command))
+    app.add_handler(CommandHandler("skill", skill_command))
+
+    # Message handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    logging.info('INIT: Initialization done! Start polling...')
     app.run_polling()
 
 
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # await update.message.reply_text(response)
-    logging.info("UPDATE: " + str(update))
-    loading_message = await update.message.reply_text('Thinking...')
+# ──────────────────────────────────────────────
+# Command Handlers: /start  /job  /skill
+# ──────────────────────────────────────────────
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
+    # Reset to default mode on start
+    context.user_data['mode'] = MODE_JOB
 
-    # send the user message to the ChatGPT client
-    response = gpt.submit(update.message.text)
+    welcome_message = (
+        "**Welcome to the AI Career Assistant!**\n\n"
+        "I am here to help you navigate your career path. I operate in two distinct modes:\n\n"
+        "**1. Job Search Mode (Default)**\n"
+        "• **Command:** `/job`\n"
+        "• **How it works:** Send me your target city, desired role, or upload your PDF/Word resume. "
+        "I will match you with the best available positions in our database.\n\n"
+        "**2. Skill Inquiry Mode**\n"
+        "• **Command:** `/skill`\n"
+        "• **How it works:** Tell me a specific job title (e.g., 'Data Analyst' or 'Product Manager'), "
+        "and I will act as a Senior HR to outline the Must-Have Skills and Bonus Points for that role.\n\n"
+        "**To begin, simply tap or type `/job` or `/skill`!**"
+    )
 
-    # send the response to the Telegram box client
-    await loading_message.edit_text(response)
+    await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
+
+async def job_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to Job Search mode."""
+    context.user_data['mode'] = MODE_JOB
+    await update.message.reply_text(
+        "Switched to [Job Search] mode. "
+        "Please send your job requirements or upload your resume, "
+        "and I will match you with the best positions in our database."
+    )
+
+
+async def skill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to Skill Inquiry mode."""
+    context.user_data['mode'] = MODE_SKILL
+    await update.message.reply_text(
+        "Switched to [Skill Inquiry] mode. "
+        "Please tell me the job title you are interested in "
+        "(e.g., 'Python Developer'), and I will outline the required skills."
+    )
+
+
+# ──────────────────────────────────────────────
+# Text Handler (routes by current mode)
+# ──────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    current_mode = context.user_data.get('mode', MODE_JOB)
+    logging.info(f"USER TEXT: {user_text} | MODE: {current_mode}")
+
+    if current_mode == MODE_SKILL:
+        # ── Skill Inquiry path ──
+        loading_message = await update.message.reply_text("Analyzing skill requirements…")
+        response = await asyncio.to_thread(gpt_skill.submit, user_text)
+        await loading_message.edit_text(response)
+    else:
+        # ── Job Search path (default) ──
+        loading_message = await update.message.reply_text(BotConfig.LOADING_TEXT)
+
+        relevant_jobs_context = ""
+
+        if rag_engine:
+            hits = rag_engine.search(user_text)
+            if hits and "Not found" not in hits[0]:
+                relevant_jobs_context = "\n\n---\n\n".join(hits)
+                logging.info(f"RAG found {len(hits)} relevant jobs.")
+            else:
+                logging.info("RAG found no relevant jobs.")
+                relevant_jobs_context = "No matching jobs found in database."
+        else:
+            relevant_jobs_context = "Job database not loaded."
+
+        gpt.set_job_context(relevant_jobs_context)
+        response = await asyncio.to_thread(gpt.submit, user_text)
+
+        await loading_message.edit_text(response)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Process user-uploaded PDF resumes
+    """
+    doc = update.message.document
+    file_name = doc.file_name
+    user_id = update.message.from_user.id
+
+    # 1. Format Pre-check
+    if not file_name.lower().endswith(('.pdf', '.doc', '.docx')):
+        await update.message.reply_text("Only PDF or Word (.doc/.docx) resumes are supported.")
+        return
+
+    loading_message = await update.message.reply_text("Downloading and parsing file...")
+    local_path = None
+    try:
+        # 2. Get download link
+        file_obj = await doc.get_file()
+        file_url = file_obj.file_path
+
+        if not file_url:
+            raise Exception("Unable to retrieve file download link.")
+
+        # 3. Create temporary file path
+        temp_dir = tempfile.gettempdir()
+        _, ext = os.path.splitext(file_name)
+        # Use unique filename to prevent conflicts
+        local_path = os.path.join(temp_dir, f"resume_{update.effective_user.id}_{update.message.message_id}{ext}")
+
+        logging.info(f"Downloading: {file_url} -> {local_path}")
+
+        # 4. Asynchronously download file
+        async with httpx.AsyncClient() as client:
+            response = await client.get(file_url)
+            response.raise_for_status()
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+
+        logging.info(f"Download successful: {local_path}")
+        await loading_message.edit_text("Extracting text (OCR may be involved)...")
+
+        # Check again if the file was actually generated
+        if not os.path.exists(local_path):
+            # If the above method fails to generate the file, try the raw download (no params, save to current dir)
+            # Note: This might save as a file named with file_id, requiring renaming. Trying with params first here.
+            raise FileNotFoundError("Download method failed to create file.")
+
+        logging.info(f"File downloaded successfully to: {local_path}")
+
+        # 3. Extract text
+        resume_text = extract_text_from_pdf(local_path)
+
+        if not resume_text or len(resume_text.strip()) == 0:
+            await loading_message.edit_text(
+                "**Parsing Failed**\n\n"
+                "No text could be extracted from the file.\n"
+                "Possible reasons:\n"
+                "1. File is a pure image and OCR failed\n"
+                "2. File is encrypted\n"
+                "3. File content is empty"
+            )
+            return
+
+        logging.info(f"File parsed successfully. Length: {len(resume_text)} chars.")
+
+        # 4. Call RAG Engine
+        if rag_engine:
+            await loading_message.edit_text("Resume parsing complete. Matching best jobs in database...")
+
+            query_text = resume_text[:2000]
+            hits = rag_engine.search(query_text)
+
+            if hits and "Not found" not in hits[0]:
+                response_msg = f"Match successful! Based on your resume, recommending the following {len(hits)} positions:\n\n"
+
+                for i, job in enumerate(hits, 1):
+                    # Clean newline characters in job string to prevent format chaos
+                    clean_job = str(job)
+                    response_msg += f"{i}. {clean_job}\n\n"
+
+                response_msg += " You can tell me which one you want to know more about."
+                await loading_message.edit_text(response_msg)
+            else:
+                await loading_message.edit_text(
+                    "No perfectly matching positions\n\n"
+                    "No positions highly matching your resume were found in the database.\n"
+                    "Suggestion: You can try sending the job title or core skills you are interested in directly (e.g., 'Python Developer')."
+                )
+        else:
+            await loading_message.edit_text("Job database not loaded, unable to provide recommendations at the moment.")
+
+    except Exception as e:
+        error_msg = str(e).replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '')
+        logging.exception(f"Error processing document {file_name}: {error_msg}")
+
+        await loading_message.edit_text(
+            f"Processing Error\n\nAn exception occurred while parsing the file: {error_msg}\n"
+            "Please try again later, or send a text description of your requirements directly."
+        )
+
+    finally:
+        # 5. Clean up temporary file
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                logging.debug(f"Temp file cleaned: {local_path}")
+            except OSError:
+                pass
 
 if __name__ == '__main__':
-    main()
+        main()
