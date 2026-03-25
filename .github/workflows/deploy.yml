@@ -1,33 +1,29 @@
-- name: Deploy to EC2
-  env:
-    SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
-    EC2_HOST: ${{ secrets.EC2_HOST }}
-    EC2_USER: ec2-user
-  run: |
-    # 1. 创建 .ssh 目录
-    mkdir -p ~/.ssh
-    
-    # 2. 将密钥写入文件 (关键：使用 cat + heredoc 或 echo -e 确保换行符正确)
-    # 这里使用 printf 避免 echo 可能带来的额外换行问题，并确保原样输出
-    printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-    
-    # 3. 设置严格的权限 (必须是 600，否则 ssh 会拒绝使用)
-    chmod 600 ~/.ssh/deploy_key
-    
-    # 4. (可选) 验证密钥是否有效，提前失败以便调试
-    if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null; then
-      echo "❌ 密钥格式错误！请检查 Secret 中的换行符。"
-      exit 1
-    fi
-    echo "✅ 密钥验证通过"
+name: AWS EC2 Deploy
 
-    # 5. 添加主机指纹防止交互确认
-    ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+on:
+  push:
+    branches:
+      - main
 
-    # 6. 执行远程命令 (直接使用 -i 指定文件，不再使用 ssh-add)
-    ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << 'EOF'
-      cd /home/ec2-user/chatbot_comp7940
-      source venv/bin/activate
-      pip install -r requirements.txt
-      # 其他启动命令...
-    EOF
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest   # must be ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_KEY }}
+
+      - name: Deploy application
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          cd ~/chatbot_comp7940
+          git pull origin main
+          # Restart chatbot inside venv
+          pkill -f "python chatbot.py" || true
+          nohup ~/chatbot_comp7940/venv/bin/python chatbot.py > app.log 2>&1 &
+          EOF
